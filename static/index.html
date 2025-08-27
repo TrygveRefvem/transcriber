@@ -1,0 +1,314 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meeting Transcriber</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+      .row { margin: 12px 0; }
+      button { padding: 8px 12px; }
+      pre { white-space: pre-wrap; background: #f5f5f7; padding: 12px; border-radius: 8px; }
+      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef; margin-right: 6px; }
+      .formatted { background: #fcfcfd; border: 1px solid #e6e6eb; border-radius: 8px; padding: 12px; }
+      .turn { margin: 8px 0; }
+      .turn .meta { color: #555; font-size: 12px; margin-bottom: 2px; }
+      .turn .text { line-height: 1.5; }
+      .speakers { background: #fbfbfe; border: 1px dashed #d9d9e3; padding: 12px; border-radius: 8px; }
+      .speaker-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+      .speaker-row input { padding: 6px 8px; }
+      .actions { margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Meeting Transcriber</h1>
+
+    <div class="row">
+      <input id="fileInput" type="file" accept="audio/*,video/*" />
+      <button id="uploadBtn">Upload & Transcribe</button>
+    </div>
+
+    <div class="row">
+      <button id="recordBtn">Start Recording</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <span id="recStatus" class="pill">Idle</span>
+    </div>
+
+    <div class="row">
+      <label><input type="checkbox" id="diarize" checked /> Diarize speakers</label>
+      <label style="margin-left:16px;"><input type="checkbox" id="tagEvents" checked /> Tag audio events</label>
+      <label style="margin-left:16px;">Language code: <input id="lang" placeholder="e.g. eng" /></label>
+    </div>
+
+    <div class="row">
+      <audio id="preview" controls></audio>
+    </div>
+
+    <div class="row">
+      <h3>Summary</h3>
+      <div id="summary" class="formatted"></div>
+    </div>
+
+    <div class="row">
+      <h3>Speakers</h3>
+      <div id="speakers" class="speakers"></div>
+    </div>
+
+    <div class="row">
+      <h3>Formatted transcript</h3>
+      <div id="formatted" class="formatted"></div>
+    </div>
+
+    <div class="row">
+      <h3>Transcript</h3>
+      <pre id="output"></pre>
+    </div>
+
+    <div class="row">
+      <h3>Text only</h3>
+      <pre id="textOnly"></pre>
+    </div>
+
+    <script>
+      const fileInput = document.getElementById('fileInput');
+      const uploadBtn = document.getElementById('uploadBtn');
+      const recordBtn = document.getElementById('recordBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const recStatus = document.getElementById('recStatus');
+      const preview = document.getElementById('preview');
+      const output = document.getElementById('output');
+      const diarize = document.getElementById('diarize');
+      const tagEvents = document.getElementById('tagEvents');
+      const lang = document.getElementById('lang');
+      const formatted = document.getElementById('formatted');
+      const textOnly = document.getElementById('textOnly');
+      const speakersEl = document.getElementById('speakers');
+      const summaryEl = document.getElementById('summary');
+
+      let mediaRecorder;
+      let chunks = [];
+      let lastResult = null;
+
+      function setStatus(text) { recStatus.textContent = text; }
+      function print(obj) { output.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
+
+      function formatTs(sec) {
+        if (sec == null || isNaN(sec)) return '';
+        const s = Math.max(0, Number(sec));
+        const m = Math.floor(s / 60);
+        const r = s - m * 60;
+        const ss = String(Math.floor(r)).padStart(2, '0');
+        const ms = String(Math.round((r - Math.floor(r)) * 1000)).padStart(3, '0');
+        return `${m}:${ss}.${ms}`;
+      }
+
+      function escapeHtml(str) {
+        return String(str)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      function loadNameMap() {
+        try { return JSON.parse(localStorage.getItem('speakerNameMap') || '{}'); } catch (_) { return {}; }
+      }
+
+      function saveNameMap(map) {
+        localStorage.setItem('speakerNameMap', JSON.stringify(map || {}));
+      }
+
+      function buildFormatted(result, nameMap) {
+        try {
+          const words = Array.isArray(result?.words) ? result.words : [];
+          if (!words.length) return '<div class="turn"><div class="text">No words returned.</div></div>';
+
+          const turns = [];
+          let current = { speaker: words[0].speaker_id || 'speaker_0', start: null, end: null, text: '' };
+
+          for (const w of words) {
+            const speaker = w.speaker_id || current.speaker;
+            const isNewSpeaker = speaker !== current.speaker;
+            if (isNewSpeaker) {
+              turns.push(current);
+              current = { speaker, start: null, end: null, text: '' };
+            }
+            if (w.start != null) current.start = current.start == null ? w.start : Math.min(current.start, w.start);
+            if (w.end != null) current.end = current.end == null ? w.end : Math.max(current.end, w.end);
+            if (w.type === 'spacing') {
+              current.text += ' ';
+            } else if (w.type === 'audio_event') {
+              current.text += ` (${w.text})`;
+            } else {
+              current.text += w.text;
+            }
+          }
+          turns.push(current);
+
+          return turns.map(t => {
+            const display = nameMap?.[t.speaker] ? `${nameMap[t.speaker]} (${t.speaker})` : t.speaker;
+            const meta = `${escapeHtml(display)}  [${formatTs(t.start)} - ${formatTs(t.end)}]`;
+            const text = escapeHtml(t.text).replace(/\s+/g, ' ').trim();
+            return `<div class="turn"><div class="meta">${meta}</div><div class="text">${text}</div></div>`;
+          }).join('');
+        } catch (e) {
+          return `<div class="turn"><div class="text">Failed to format transcript.</div></div>`;
+        }
+      }
+
+      function buildSummary(result, nameMap) {
+        const text = result?.text || '';
+        const words = Array.isArray(result?.words) ? result.words : [];
+        const speakers = uniqueSpeakers(result);
+        const names = speakers.map(id => nameMap?.[id] || id);
+        let duration = '';
+        if (words.length) {
+          const first = words.find(w => w.start != null);
+          const last = [...words].reverse().find(w => w.end != null);
+          if (first && last) {
+            duration = `${formatTs(first.start)} - ${formatTs(last.end)} (${(last.end - first.start).toFixed(1)}s)`;
+          }
+        }
+        const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean);
+        let summaryText = text;
+        if (sentences.length > 2) summaryText = sentences.slice(0, 2).join(' ');
+        if (summaryText.length > 400) summaryText = summaryText.slice(0, 397) + '...';
+        const meta = `Speakers: ${escapeHtml(names.join(', '))}${duration ? ' • Duration: ' + escapeHtml(duration) : ''}`;
+        return `<div class="meta">${meta}</div><div class="text">${escapeHtml(summaryText)}</div>`;
+      }
+
+      function uniqueSpeakers(result) {
+        const set = new Set();
+        const words = Array.isArray(result?.words) ? result.words : [];
+        for (const w of words) {
+          if (w.speaker_id) set.add(w.speaker_id);
+        }
+        return Array.from(set);
+      }
+
+      function renderSpeakers(result) {
+        const ids = uniqueSpeakers(result);
+        const nameMap = loadNameMap();
+        if (!ids.length) { speakersEl.innerHTML = '<div>No speakers detected.</div>'; return; }
+        const rows = ids.map(id => {
+          const val = nameMap[id] || '';
+          return `<div class="speaker-row"><label style="min-width:110px;">${escapeHtml(id)}</label><input data-speaker-id="${escapeHtml(id)}" type="text" placeholder="Enter name" value="${escapeHtml(val)}" /></div>`;
+        }).join('');
+        speakersEl.innerHTML = rows + '<div class="actions"><button id="applyNames">Apply names</button></div>';
+        // Wire inputs
+        speakersEl.querySelectorAll('input[data-speaker-id]').forEach(input => {
+          input.addEventListener('input', () => {
+            const id = input.getAttribute('data-speaker-id');
+            const map = loadNameMap();
+            map[id] = input.value;
+            saveNameMap(map);
+          });
+        });
+        const applyBtn = document.getElementById('applyNames');
+        if (applyBtn) {
+          applyBtn.addEventListener('click', () => {
+            if (!lastResult) return;
+            const map = loadNameMap();
+            formatted.innerHTML = buildFormatted(lastResult, map);
+            summaryEl.innerHTML = buildSummary(lastResult, map);
+          });
+        }
+      }
+
+      async function transcribeBlob(blob) {
+        const form = new FormData();
+        form.append('file', blob, 'recording.webm');
+        form.append('diarize', String(diarize.checked));
+        form.append('tag_audio_events', String(tagEvents.checked));
+        if (lang.value.trim()) form.append('language_code', lang.value.trim());
+
+        const res = await fetch('/api/transcribe', { method: 'POST', body: form });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(err.detail || 'Transcription failed');
+        }
+        const json = await res.json();
+        lastResult = json;
+        renderSpeakers(json);
+        const map = loadNameMap();
+        formatted.innerHTML = buildFormatted(json, map);
+        summaryEl.innerHTML = buildSummary(json, map);
+        textOnly.textContent = json?.text || '';
+
+        // Try Azure summary if configured
+        try {
+          const res2 = await fetch('/api/summarize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: json?.text || '',
+              words: json?.words || [],
+              language_code: json?.language_code,
+              speaker_names: map,
+            }),
+          });
+          if (res2.ok) {
+            const j2 = await res2.json();
+            if (j2?.summary_text) {
+              summaryEl.innerHTML = `<div class="text">${escapeHtml(j2.summary_text)}</div>`;
+            }
+          }
+        } catch (e) { /* ignore */ }
+
+        return json;
+      }
+
+      uploadBtn.addEventListener('click', async () => {
+        try {
+          if (!fileInput.files.length) return alert('Choose a file first');
+          setStatus('Uploading...');
+          const file = fileInput.files[0];
+          preview.src = URL.createObjectURL(file);
+          const result = await transcribeBlob(file);
+          print(result);
+          setStatus('Done');
+        } catch (e) {
+          print({ error: e.message });
+          setStatus('Error');
+        }
+      });
+
+      recordBtn.addEventListener('click', async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream);
+          chunks = [];
+          mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+          mediaRecorder.onstop = async () => {
+            const blob = new Blob(chunks, { type: 'audio/webm' });
+            preview.src = URL.createObjectURL(blob);
+            setStatus('Transcribing...');
+            try {
+              const result = await transcribeBlob(blob);
+              print(result);
+              setStatus('Done');
+            } catch (e) {
+              print({ error: e.message });
+              setStatus('Error');
+            }
+          };
+          mediaRecorder.start();
+          recordBtn.disabled = true;
+          stopBtn.disabled = false;
+          setStatus('Recording...');
+        } catch (e) {
+          alert('Mic permission denied or unavailable');
+        }
+      });
+
+      stopBtn.addEventListener('click', () => {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+          recordBtn.disabled = false;
+          stopBtn.disabled = true;
+        }
+      });
+    </script>
+  </body>
+  </html>
+
+
