@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     AZURE_OPENAI_ENDPOINT: Optional[str] = None
     AZURE_OPENAI_API_KEY: Optional[str] = None
     AZURE_OPENAI_DEPLOYMENT: Optional[str] = None
+    MS_CLIENT_ID: Optional[str] = None
+    MS_TENANT_ID: Optional[str] = "common"
+    MS_REDIRECT_URI: Optional[str] = None
 
     class Config:
         env_file = ".env"
@@ -45,6 +48,24 @@ def healthz():
 def debug_key():
     key = settings.ELEVENLABS_API_KEY or ""
     return {"length": len(key), "suffix": key[-6:] if key else None}
+
+
+@app.get("/config/ms")
+def ms_config():
+    # Minimal config for msal-browser on localhost
+    client_id = settings.MS_CLIENT_ID or ""
+    tenant = (settings.MS_TENANT_ID or "common").strip()
+    redirect_uri = settings.MS_REDIRECT_URI or "http://localhost:8010/"
+    authority = f"https://login.microsoftonline.com/{tenant}"
+    scopes = ["User.Read", "Calendars.ReadWrite", "offline_access"]
+    enabled = bool(client_id)
+    return {
+        "enabled": enabled,
+        "clientId": client_id,
+        "authority": authority,
+        "redirectUri": redirect_uri,
+        "scopes": scopes,
+    }
 
 
 @app.post("/api/transcribe")
@@ -136,16 +157,17 @@ async def summarize(payload: dict):
     if not text and not words:
         raise HTTPException(status_code=400, detail="Missing transcript content")
 
-    # Build a brief, deterministic prompt
+    # Build a brief, deterministic prompt with strict language control
     system_prompt = (
-        "You are an assistant that writes concise, factual meeting summaries. "
-        "If a target language is specified via language_code, you MUST write the entire output in that target language. "
-        "Otherwise, write in the same language as the transcript. "
-        "Include:\n"
-        "- A 3-6 sentence meeting summary\n"
-        "- 3-7 bullet Action Items (with owners if inferable)\n"
-        "- 2-5 bullet Decisions (if any)\n"
-        "Be faithful to the transcript; do not invent facts."
+        "You are an assistant that produces high-quality, factual meeting summaries. "
+        "If a target language is specified via language_code, you MUST write the ENTIRE output in that target language. "
+        "For 'nor' use Norwegian Bokmål. Do not use Swedish unless the transcript is Swedish. "
+        "If no language_code is given, use the transcript language.\n\n"
+        "Output structure (use headings appropriate to the target language):\n"
+        "- Summary: 4–8 sentences that cover purpose, key points, and outcomes\n"
+        "- Action items: 3–7 bullets (assign owners if inferable)\n"
+        "- Decisions: 2–5 bullets (if any)\n\n"
+        "Guidelines: Be clear and faithful to the transcript. Ignore beeps and filler words. Do not invent facts."
     )
 
     # Compact speaker map for context
@@ -163,7 +185,7 @@ async def summarize(payload: dict):
             text = ""
 
     language_hint = (
-        f"Target language (ISO-639 code): {language_code}. Write the ENTIRE output in this target language." 
+        f"Target language (ISO-639 code): {language_code}. Write the ENTIRE output in this target language."
         if language_code else ""
     )
     user_prompt = (
@@ -172,41 +194,87 @@ async def summarize(payload: dict):
         f"Transcript:\n{text}"
     ).strip()
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    # Azure OpenAI chat completions call
-    try:
-        headers = {
-            "Content-Type": "application/json",
-            "api-key": settings.AZURE_OPENAI_API_KEY,
-        }
-        body = {
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 400,
-            "top_p": 1,
-        }
-        async with httpx.AsyncClient(timeout=60) as client:
+    # Helper: call Azure chat completions
+    async def azure_chat(messages: list[dict]) -> str:
+        headers = {"Content-Type": "application/json", "api-key": settings.AZURE_OPENAI_API_KEY}
+        body = {"messages": messages, "temperature": 0.2, "max_tokens": 1000, "top_p": 1}
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(settings.AZURE_OPENAI_ENDPOINT, headers=headers, json=body)
         if resp.status_code >= 400:
-            # Propagate upstream error for easier debugging
-            detail = None
             try:
                 detail = resp.json()
             except Exception:
                 detail = resp.text
             raise HTTPException(status_code=resp.status_code, detail=detail)
-
         data = resp.json()
-        content = (
-            (data.get("choices") or [{}])[0]
-            .get("message", {})
-            .get("content", "")
+        return ((data.get("choices") or [{}])[0].get("message", {}).get("content", ""))
+
+    # If text missing, reconstruct from words
+    if not text and isinstance(words, list):
+        try:
+            text = "".join([w.get("text", " ") for w in words])
+        except Exception:
+            text = ""
+
+    # Chunk if too long (heuristic by characters)
+    def split_into_chunks(source: str, target_size: int = 7000) -> list[str]:
+        if not source or len(source) <= target_size:
+            return [source] if source else []
+        # Prefer to split on sentence boundaries
+        import re
+        sentences = re.split(r"(?<=[.!?])\s+", source)
+        chunks: list[str] = []
+        current = []
+        current_len = 0
+        for s in sentences:
+            sl = len(s) + 1
+            if current_len + sl > target_size and current:
+                chunks.append(" ".join(current).strip())
+                current = [s]
+                current_len = sl
+            else:
+                current.append(s)
+                current_len += sl
+        if current:
+            chunks.append(" ".join(current).strip())
+        return chunks
+
+    try:
+        chunks = split_into_chunks(text, 7000)
+
+        if len(chunks) <= 1:
+            # Single-shot
+            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+            content = await azure_chat(messages)
+            return {"summary_text": content}
+
+        # Map-Reduce: summarize each chunk, then synthesize
+        map_summaries: list[str] = []
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            map_user = (
+                f"{language_hint}\n"
+                f"Speaker names (if provided):\n{speaker_block}\n\n"
+                f"You will summarize chunk {idx} of {total}.\n"
+                f"Chunk transcript:\n{chunk}"
+            ).strip()
+            map_messages = [
+                {"role": "system", "content": system_prompt + "\nSummarize ONLY this chunk."},
+                {"role": "user", "content": map_user},
+            ]
+            map_summaries.append(await azure_chat(map_messages))
+
+        reduce_user = (
+            f"{language_hint}\nSpeaker names (if provided):\n{speaker_block}\n\n"
+            f"Synthesize a final meeting summary from these chunk summaries (ordered):\n\n"
+            + "\n\n".join([f"Chunk {i+1} of {total}:\n{ms}" for i, ms in enumerate(map_summaries)])
         )
-        return {"summary_text": content}
+        reduce_messages = [
+            {"role": "system", "content": system_prompt + "\nCreate ONE cohesive summary for the full meeting."},
+            {"role": "user", "content": reduce_user},
+        ]
+        final_summary = await azure_chat(reduce_messages)
+        return {"summary_text": final_summary}
     except HTTPException:
         raise
     except Exception as exc:

@@ -18,6 +18,12 @@
       .speaker-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
       .speaker-row input { padding: 6px 8px; }
       .actions { margin-top: 8px; }
+      .ms { background: #f6f9ff; border: 1px solid #dbe7ff; padding: 12px; border-radius: 8px; }
+      .muted { color: #666; }
+      .summary { background: #fdfaf5; border: 1px solid #f0e6d6; border-radius: 8px; padding: 12px; }
+      .speaker-badge { display: inline-block; background: #eef; border-radius: 999px; padding: 2px 10px; font-weight: 600; margin-right: 8px; }
+      .ts { color: #666; font-size: 12px; }
+      .audio-event { color: #7a7a7a; font-style: italic; }
     </style>
   </head>
   <body>
@@ -47,6 +53,20 @@
     <div class="row">
       <h3>Summary</h3>
       <div id="summary" class="formatted"></div>
+    </div>
+
+    <div class="row">
+      <h3>Microsoft 365</h3>
+      <div class="ms">
+        <div id="msStatus" class="muted">Loading Microsoft config…</div>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+          <button id="msSignIn">Sign in</button>
+          <button id="msSignOut" disabled>Sign out</button>
+          <button id="msLoadMeetings" disabled>Load my meetings</button>
+          <select id="msEvents" disabled></select>
+          <button id="msSaveNotes" disabled>Save notes to event</button>
+        </div>
+      </div>
     </div>
 
     <div class="row">
@@ -84,10 +104,19 @@
       const textOnly = document.getElementById('textOnly');
       const speakersEl = document.getElementById('speakers');
       const summaryEl = document.getElementById('summary');
+      const msStatus = document.getElementById('msStatus');
+      const msSignIn = document.getElementById('msSignIn');
+      const msSignOut = document.getElementById('msSignOut');
+      const msLoadMeetings = document.getElementById('msLoadMeetings');
+      const msEvents = document.getElementById('msEvents');
+      const msSaveNotes = document.getElementById('msSaveNotes');
 
       let mediaRecorder;
       let chunks = [];
       let lastResult = null;
+      let msalApp = null;
+      let msAccount = null;
+      let msConfig = null;
 
       function setStatus(text) { recStatus.textContent = text; }
       function print(obj) { output.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
@@ -107,6 +136,47 @@
           .replace(/&/g, '&amp;')
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;');
+      }
+
+      function renderSummaryMarkdownInto(el, rawText) {
+        const safe = escapeHtml(rawText || '');
+        const lines = safe.split(/\n+/);
+        let html = '';
+        let inList = false;
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (line.startsWith('### ')) { if (inList) { html += '</ul>'; inList = false; } html += `<h3>${line.slice(4)}</h3>`; continue; }
+          if (line.startsWith('## '))  { if (inList) { html += '</ul>'; inList = false; } html += `<h2>${line.slice(3)}</h2>`; continue; }
+          if (line.startsWith('- '))   { if (!inList) { html += '<ul>'; inList = true; } html += `<li>${line.slice(2).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</li>`; continue; }
+          if (!line) { if (inList) { html += '</ul>'; inList = false; } continue; }
+          html += `<p>${line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</p>`;
+        }
+        if (inList) html += '</ul>';
+        el.innerHTML = `<div class="summary">${html}</div>`;
+      }
+
+      function formatLocalDateTime(isoLike) {
+        try {
+          if (!isoLike) return '';
+          const d = new Date(isoLike);
+          // Fallback if parse fails
+          if (isNaN(d.getTime())) return String(isoLike);
+          return d.toLocaleString(undefined, {
+            year: 'numeric', month: 'short', day: '2-digit',
+            hour: '2-digit', minute: '2-digit'
+          });
+        } catch (_) {
+          return String(isoLike);
+        }
+      }
+
+      function parseGraphDateTime(dateTime, timeZone) {
+        if (!dateTime) return null;
+        // If Graph says the value is in UTC but the string lacks 'Z', coerce to UTC
+        const isUtc = (timeZone || '').toUpperCase() === 'UTC' || /Z$/.test(dateTime);
+        const iso = isUtc && !/Z$/.test(dateTime) ? `${dateTime}Z` : dateTime;
+        const d = new Date(iso);
+        return isNaN(d.getTime()) ? null : d;
       }
 
       function loadNameMap() {
@@ -155,6 +225,160 @@
         }
       }
 
+      // ---------- Microsoft Graph integration (optional) ----------
+      async function loadMsConfig() {
+        try {
+          const res = await fetch('/config/ms');
+          msConfig = await res.json();
+          if (!msConfig?.enabled) {
+            msStatus.textContent = 'Microsoft integration is not configured. Set MS_CLIENT_ID (and optional MS_TENANT_ID, MS_REDIRECT_URI) in .env.';
+            disableMsUI(true);
+            return;
+          }
+          // Load MSAL script dynamically
+          await loadScript('https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js');
+          const config = {
+            auth: {
+              clientId: msConfig.clientId,
+              authority: msConfig.authority,
+              redirectUri: msConfig.redirectUri,
+            },
+            cache: { cacheLocation: 'localStorage', storeAuthStateInCookie: false },
+          };
+          // eslint-disable-next-line no-undef
+          msalApp = new msal.PublicClientApplication(config);
+          const accounts = msalApp.getAllAccounts();
+          if (accounts && accounts.length) {
+            msAccount = accounts[0];
+            msalApp.setActiveAccount(msAccount);
+            msStatus.textContent = `Signed in as ${msAccount.username}`;
+            disableMsUI(false);
+          } else {
+            msStatus.textContent = 'Not signed in';
+            disableMsUI(true);
+          }
+        } catch (e) {
+          msStatus.textContent = 'Failed to initialize Microsoft integration.';
+          disableMsUI(true);
+        }
+      }
+
+      function disableMsUI(disabled) {
+        msSignIn.disabled = !msConfig?.enabled ? true : false;
+        msSignOut.disabled = disabled;
+        msLoadMeetings.disabled = disabled;
+        msEvents.disabled = disabled;
+        msSaveNotes.disabled = disabled;
+      }
+
+      function loadScript(src) {
+        return new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = src; s.async = true; s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+        });
+      }
+
+      async function ensureToken(scopes) {
+        if (!msalApp) throw new Error('MSAL not initialized');
+        const request = { scopes, account: msalApp.getActiveAccount() };
+        try {
+          const r = await msalApp.acquireTokenSilent(request);
+          return r.accessToken;
+        } catch (_) {
+          const r = await msalApp.acquireTokenPopup({ scopes });
+          return r.accessToken;
+        }
+      }
+
+      async function listMeetings() {
+        try {
+          const token = await ensureToken(msConfig.scopes);
+          const now = new Date();
+          const start = new Date(now.getTime() - 24*60*60*1000).toISOString(); // 1 day back
+          const end = new Date(now.getTime() + 30*24*60*60*1000).toISOString(); // 30 days forward
+          const url = `https://graph.microsoft.com/v1.0/me/calendarView?startDateTime=${encodeURIComponent(start)}&endDateTime=${encodeURIComponent(end)}&$top=50&$orderby=start/dateTime&$select=id,subject,start,end,organizer`;
+          const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+          const j = await res.json();
+          const events = Array.isArray(j.value) ? j.value : [];
+          msEvents.innerHTML = events.map(ev => {
+            const subj = ev.subject || '(no subject)';
+            const startDt = ev.start?.dateTime || '';
+            const tz = ev.start?.timeZone || '';
+            const d = parseGraphDateTime(startDt, tz);
+            const pretty = d ? d.toLocaleString(undefined, { year:'numeric', month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit' }) : startDt;
+            return `<option value="${ev.id}">${escapeHtml(subj)} — ${escapeHtml(pretty)}</option>`;
+          }).join('');
+          if (events.length) msEvents.value = events[0].id;
+          msStatus.textContent = `Loaded ${events.length} events`;
+        } catch (e) {
+          msStatus.textContent = 'Failed to load meetings.';
+        }
+      }
+
+      function buildHtmlNotes() {
+        const map = loadNameMap();
+        const formattedHtml = buildFormatted(lastResult || {}, map);
+        const summaryText = summaryEl.innerText || '';
+        return [
+          '<div><h2>Meeting notes (Transcriber)</h2>',
+          `<h3>AI Summary</h3><p>${escapeHtml(summaryText).replace(/\n/g, '<br/>')}</p>`,
+          '<h3>Transcript</h3>',
+          formattedHtml,
+          '</div>'
+        ].join('');
+      }
+
+      async function saveNotesToEvent() {
+        if (!lastResult) { alert('Transcribe first'); return; }
+        const eventId = msEvents.value;
+        if (!eventId) { alert('Pick an event'); return; }
+        try {
+          const token = await ensureToken(['Calendars.ReadWrite']);
+          // Get existing body
+          const getRes = await fetch(`https://graph.microsoft.com/v1.0/me/events/${eventId}?$select=body`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          const event = await getRes.json();
+          const existing = event?.body?.content || '';
+          const notes = buildHtmlNotes();
+          const merged = existing ? existing + '<hr/>' + notes : notes;
+          const patchRes = await fetch(`https://graph.microsoft.com/v1.0/me/events/${eventId}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ body: { contentType: 'html', content: merged } })
+          });
+          if (!patchRes.ok) throw new Error('PATCH failed');
+          msStatus.textContent = 'Notes saved to event.';
+        } catch (e) {
+          msStatus.textContent = 'Failed to save notes.';
+        }
+      }
+
+      msSignIn.addEventListener('click', async () => {
+        if (!msalApp) return;
+        try {
+          const login = await msalApp.loginPopup({ scopes: msConfig.scopes });
+          msAccount = login.account;
+          msalApp.setActiveAccount(msAccount);
+          msStatus.textContent = `Signed in as ${msAccount.username}`;
+          disableMsUI(false);
+        } catch (_) { /* ignore */ }
+      });
+
+      msSignOut.addEventListener('click', async () => {
+        if (!msalApp) return;
+        try { await msalApp.logoutPopup(); } catch (_) {}
+        msAccount = null;
+        msStatus.textContent = 'Signed out';
+        disableMsUI(true);
+      });
+
+      msLoadMeetings.addEventListener('click', listMeetings);
+      msSaveNotes.addEventListener('click', saveNotesToEvent);
+
+      // Init MSAL config on load
+      loadMsConfig();
+
       function buildSummary(result, nameMap) {
         const text = result?.text || '';
         const words = Array.isArray(result?.words) ? result.words : [];
@@ -190,10 +414,10 @@
         const nameMap = loadNameMap();
         if (!ids.length) { speakersEl.innerHTML = '<div>No speakers detected.</div>'; return; }
         const rows = ids.map(id => {
-          const val = nameMap[id] || '';
+          const val = '';
           return `<div class="speaker-row"><label style="min-width:110px;">${escapeHtml(id)}</label><input data-speaker-id="${escapeHtml(id)}" type="text" placeholder="Enter name" value="${escapeHtml(val)}" /></div>`;
         }).join('');
-        speakersEl.innerHTML = rows + '<div class="actions"><button id="applyNames">Apply names</button></div>';
+        speakersEl.innerHTML = rows + '<div class="actions"><button id="applyNames">Apply names</button><button id="summarizeBtn" style="margin-left:8px;">Summarize</button></div>';
         // Wire inputs
         speakersEl.querySelectorAll('input[data-speaker-id]').forEach(input => {
           input.addEventListener('input', () => {
@@ -212,6 +436,36 @@
             summaryEl.innerHTML = buildSummary(lastResult, map);
           });
         }
+
+        const summarizeBtn = document.getElementById('summarizeBtn');
+        if (summarizeBtn) {
+          summarizeBtn.addEventListener('click', async () => {
+            if (!lastResult) return;
+            const map = loadNameMap();
+            try {
+              const res2 = await fetch('/api/summarize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  text: lastResult?.text || '',
+                  words: lastResult?.words || [],
+                  language_code: lastResult?.language_code,
+                  speaker_names: map,
+                }),
+              });
+              if (res2.ok) {
+                const j2 = await res2.json();
+                if (j2?.summary_text) {
+                  renderSummaryMarkdownInto(summaryEl, j2.summary_text);
+                  return;
+                }
+              }
+              summaryEl.innerHTML = buildSummary(lastResult, map);
+            } catch (_) {
+              summaryEl.innerHTML = buildSummary(lastResult, map);
+            }
+          });
+        }
       }
 
       async function transcribeBlob(blob) {
@@ -220,6 +474,8 @@
         form.append('diarize', String(diarize.checked));
         form.append('tag_audio_events', String(tagEvents.checked));
         if (lang.value.trim()) form.append('language_code', lang.value.trim());
+        // Clear previous speaker-name map so new run starts blank
+        try { localStorage.removeItem('speakerNameMap'); } catch (_) {}
 
         const res = await fetch('/api/transcribe', { method: 'POST', body: form });
         if (!res.ok) {
@@ -249,7 +505,25 @@
           if (res2.ok) {
             const j2 = await res2.json();
             if (j2?.summary_text) {
-              summaryEl.innerHTML = `<div class="text">${escapeHtml(j2.summary_text)}</div>`;
+              // Render lightweight markdown for headings/bullets/bold
+              try {
+                const safe = escapeHtml(j2.summary_text);
+                const lines = safe.split(/\n+/);
+                let html = '';
+                let inList = false;
+                for (const raw of lines) {
+                  const line = raw.trim();
+                  if (line.startsWith('### ')) { if (inList) { html += '</ul>'; inList = false; } html += `<h3>${line.slice(4)}</h3>`; continue; }
+                  if (line.startsWith('## '))  { if (inList) { html += '</ul>'; inList = false; } html += `<h2>${line.slice(3)}</h2>`; continue; }
+                  if (line.startsWith('- '))   { if (!inList) { html += '<ul>'; inList = true; } html += `<li>${line.slice(2).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</li>`; continue; }
+                  if (!line) { if (inList) { html += '</ul>'; inList = false; } continue; }
+                  html += `<p>${line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</p>`;
+                }
+                if (inList) html += '</ul>';
+                summaryEl.innerHTML = `<div class="summary">${html}</div>`;
+              } catch (_) {
+                summaryEl.innerHTML = `<div class="text">${safe}</div>`;
+              }
             }
           }
         } catch (e) { /* ignore */ }
