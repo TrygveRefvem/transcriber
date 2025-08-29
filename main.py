@@ -1,12 +1,15 @@
 import io
 import json
+import os
+import re
+import logging
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from elevenlabs.client import ElevenLabs
 try:
     import httpx  # type: ignore
@@ -22,12 +25,23 @@ class Settings(BaseSettings):
     MS_CLIENT_ID: Optional[str] = None
     MS_TENANT_ID: Optional[str] = "common"
     MS_REDIRECT_URI: Optional[str] = None
+    NOTION_API_KEY: Optional[str] = None
+    NOTION_DATABASE_ID: Optional[str] = None
 
-    class Config:
-        env_file = ".env"
+    # Ensure .env is loaded in pydantic-settings v2
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 settings = Settings()
+
+# Logger setup
+logger = logging.getLogger("transcriber")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 app = FastAPI(title="Meeting Transcriber", version="0.1.0")
 
@@ -65,6 +79,31 @@ def ms_config():
         "authority": authority,
         "redirectUri": redirect_uri,
         "scopes": scopes,
+    }
+
+
+@app.get("/config/notion")
+def notion_config():
+    # Robustly detect Notion config from settings, env vars, or .env
+    api_key, db_id = _get_notion_credentials()
+    enabled = bool(api_key and db_id)
+    return {
+        "enabled": enabled,
+        "hasApiKey": bool(api_key),
+        "hasDatabaseId": bool(db_id),
+    }
+
+
+@app.get("/debug/notion")
+def debug_notion():
+    api_key, db_id = _get_notion_credentials()
+    norm_id = normalize_notion_id(db_id or "") if db_id else None
+    return {
+        "api_key_length": len(api_key or ""),
+        "api_key_suffix": (api_key[-6:] if api_key else None),
+        "database_id_length": len(db_id or ""),
+        "database_id_suffix": (db_id[-6:] if db_id else None),
+        "normalized_database_id": norm_id,
     }
 
 
@@ -153,6 +192,7 @@ async def summarize(payload: dict):
     words = payload.get("words") or []
     language_code = payload.get("language_code") or ""
     speaker_names = payload.get("speaker_names") or {}
+    calendar_context = payload.get("calendar_context") or ""
 
     if not text and not words:
         raise HTTPException(status_code=400, detail="Missing transcript content")
@@ -162,6 +202,7 @@ async def summarize(payload: dict):
         "You are an assistant that produces high-quality, factual meeting summaries. "
         "If a target language is specified via language_code, you MUST write the ENTIRE output in that target language. "
         "For 'nor' use Norwegian Bokmål. Do not use Swedish unless the transcript is Swedish. "
+        "Do not use Danish unless language_code is 'dan'. "
         "If no language_code is given, use the transcript language.\n\n"
         "Output structure (use headings appropriate to the target language):\n"
         "- Summary: 4–8 sentences that cover purpose, key points, and outcomes\n"
@@ -188,9 +229,14 @@ async def summarize(payload: dict):
         f"Target language (ISO-639 code): {language_code}. Write the ENTIRE output in this target language."
         if language_code else ""
     )
+    calendar_block = (
+        f"Meeting details from calendar (agenda/topic/description if present):\n{calendar_context}\n\n"
+        if calendar_context else ""
+    )
     user_prompt = (
         f"{language_hint}\n" \
         f"Speaker names (if provided):\n{speaker_block}\n\n" \
+        f"{calendar_block}" \
         f"Transcript:\n{text}"
     ).strip()
 
@@ -279,6 +325,157 @@ async def summarize(payload: dict):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/notion/export")
+async def notion_export(payload: dict):
+    """Create a Notion page with the summary and formatted transcript.
+
+    Expected payload: { title?: str, audio_url?: str, summary_text: str, formatted_html?: str }
+    """
+    logger.info("Notion export: request received")
+    api_key, db_id = _get_notion_credentials()
+    if not api_key or not db_id:
+        logger.warning("Notion export: Not configured (api_key_len=%s, db_id_len=%s)", len(api_key or ""), len(db_id or ""))
+        raise HTTPException(status_code=501, detail="Notion not configured")
+    if httpx is None:
+        raise HTTPException(status_code=500, detail="httpx not available on server")
+
+    title = (payload.get("title") or "Audio Summary").strip() or "Audio Summary"
+    audio_url = payload.get("audio_url") or ""
+    summary_text = payload.get("summary_text") or ""
+    formatted_html = payload.get("formatted_html") or ""
+
+    if not summary_text:
+        raise HTTPException(status_code=400, detail="Missing summary_text")
+
+    logger.info(
+        "Notion export: payload meta title_len=%s summary_len=%s formatted_len=%s audio_url_set=%s",
+        len(title), len(summary_text), len(formatted_html), bool(audio_url),
+    )
+
+    # Build Notion page create payload
+    # Properties: Only Name (Title) to avoid schema coupling
+    properties = {
+        "Name": {
+            "title": [{"text": {"content": title[:200]}}]
+        }
+    }
+
+    children = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "AI Summary"}}]}
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": summary_text[:19500]}}]
+            }
+        }
+    ]
+    if formatted_html:
+        # Put transcript as a code block (HTML) for fidelity; Notion markdown/html import is limited via API.
+        children.append({
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Transcript"}}]}
+        })
+        children.append({
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": [{"type": "text", "text": {"content": formatted_html[:19500]}}],
+                "language": "html"
+            }
+        })
+
+    normalized_db_id = normalize_notion_id(db_id)
+    logger.info("Notion export: using database_id raw=%s normalized=%s", db_id, normalized_db_id)
+    body = {
+        "parent": {"type": "database_id", "database_id": normalized_db_id},
+        "properties": properties,
+        "children": children,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post("https://api.notion.com/v1/pages", headers=headers, json=body)
+        logger.info("Notion export: response status=%s", resp.status_code)
+        if resp.status_code >= 400:
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            # Truncate to avoid huge logs
+            log_excerpt = (detail if isinstance(detail, str) else json.dumps(detail))[:500]
+            logger.warning("Notion export: error body=%s", log_excerpt)
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        j = resp.json()
+        logger.info("Notion export: success page_id=%s", (j.get("id") if isinstance(j, dict) else None))
+        return j
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Notion export: unexpected error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _get_notion_credentials() -> tuple[Optional[str], Optional[str]]:
+    """Resolve Notion API key and Database ID from settings, env, or .env as fallback.
+
+    Returns (api_key, database_id) where either can be None if unresolved.
+    """
+    api_key = settings.NOTION_API_KEY or os.getenv("NOTION_API_KEY")
+    db_id = settings.NOTION_DATABASE_ID or os.getenv("NOTION_DATABASE_ID")
+    if api_key and db_id:
+        return api_key.strip() or None, db_id.strip() or None
+
+    # Fallback: read .env manually
+    try:
+        env_path = ".env"
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8-sig") as fh:
+                for raw in fh:
+                    line = raw.rstrip("\r\n")
+                    if not line or line.lstrip().startswith("#"):
+                        continue
+                    m1 = re.match(r"^\s*NOTION_API_KEY\s*=\s*(.*)$", line)
+                    if m1 and not api_key:
+                        api_key = m1.group(1).strip()
+                        continue
+                    m2 = re.match(r"^\s*NOTION_DATABASE_ID\s*=\s*(.*)$", line)
+                    if m2 and not db_id:
+                        db_id = m2.group(1).strip()
+    except Exception:
+        # Ignore .env read errors; just return what we have
+        pass
+
+    api_key = (api_key or "").strip() or None
+    db_id = (db_id or "").strip() or None
+    return api_key, db_id
+
+
+def normalize_notion_id(raw: str) -> str:
+    """Return database ID in dashed UUID format if possible.
+
+    Accepts dashed or undashed; strips non-hex, enforces 32 hex chars,
+    then inserts dashes as 8-4-4-4-12.
+    """
+    if not raw:
+        return raw
+    hex_only = re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+    if len(hex_only) != 32:
+        return raw
+    return f"{hex_only[0:8]}-{hex_only[8:12]}-{hex_only[12:16]}-{hex_only[16:20]}-{hex_only[20:32]}"
 
 
 # Serve a simple static UI from / (index.html lives in ./static)

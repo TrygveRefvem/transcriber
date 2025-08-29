@@ -70,6 +70,17 @@
     </div>
 
     <div class="row">
+      <h3>Notion</h3>
+      <div class="ms">
+        <div id="notionStatus" class="muted">Loading Notion config…</div>
+        <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
+          <input id="notionTitle" placeholder="Title (defaults to Audio Summary)" style="flex:1; min-width:240px;" />
+          <button id="exportNotion" disabled>Export to Notion</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
       <h3>Speakers</h3>
       <div id="speakers" class="speakers"></div>
     </div>
@@ -110,6 +121,9 @@
       const msLoadMeetings = document.getElementById('msLoadMeetings');
       const msEvents = document.getElementById('msEvents');
       const msSaveNotes = document.getElementById('msSaveNotes');
+      const notionStatus = document.getElementById('notionStatus');
+      const exportNotion = document.getElementById('exportNotion');
+      const notionTitle = document.getElementById('notionTitle');
 
       let mediaRecorder;
       let chunks = [];
@@ -117,6 +131,7 @@
       let msalApp = null;
       let msAccount = null;
       let msConfig = null;
+      let notionConfig = null;
 
       function setStatus(text) { recStatus.textContent = text; }
       function print(obj) { output.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2); }
@@ -316,14 +331,10 @@
       }
 
       function buildHtmlNotes() {
-        const map = loadNameMap();
-        const formattedHtml = buildFormatted(lastResult || {}, map);
         const summaryText = summaryEl.innerText || '';
         return [
           '<div><h2>Meeting notes (Transcriber)</h2>',
           `<h3>AI Summary</h3><p>${escapeHtml(summaryText).replace(/\n/g, '<br/>')}</p>`,
-          '<h3>Transcript</h3>',
-          formattedHtml,
           '</div>'
         ].join('');
       }
@@ -375,9 +386,58 @@
 
       msLoadMeetings.addEventListener('click', listMeetings);
       msSaveNotes.addEventListener('click', saveNotesToEvent);
+      // Auto re-run summary when selected event changes
+      msEvents.addEventListener('change', async () => {
+        if (!lastResult) return;
+        await summarizeWithCalendarContext();
+      });
 
       // Init MSAL config on load
       loadMsConfig();
+
+      // ---------- Notion integration ----------
+      async function loadNotionConfig() {
+        try {
+          const res = await fetch('/config/notion');
+          notionConfig = await res.json();
+          if (!notionConfig?.enabled) {
+            notionStatus.textContent = 'Notion is not configured. Set NOTION_API_KEY and NOTION_DATABASE_ID in .env.';
+            exportNotion.disabled = true;
+            return;
+          }
+          notionStatus.textContent = 'Notion is ready.';
+          exportNotion.disabled = false;
+        } catch (_) {
+          notionStatus.textContent = 'Failed to load Notion config.';
+          exportNotion.disabled = true;
+        }
+      }
+      loadNotionConfig();
+
+      exportNotion.addEventListener('click', async () => {
+        if (!lastResult) { alert('Transcribe first'); return; }
+        try {
+          const title = (notionTitle.value || '').trim();
+          const map = loadNameMap();
+          const formattedHtml = buildFormatted(lastResult, map);
+          const summaryText = summaryEl.innerText || '';
+          const res = await fetch('/api/notion/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: title || undefined,
+              audio_url: '',
+              summary_text: summaryText,
+              formatted_html: formattedHtml,
+            })
+          });
+          if (!res.ok) throw new Error((await res.text()) || 'Export failed');
+          const j = await res.json();
+          notionStatus.textContent = 'Exported to Notion.';
+        } catch (e) {
+          notionStatus.textContent = 'Failed to export to Notion.';
+        }
+      });
 
       function buildSummary(result, nameMap) {
         const text = result?.text || '';
@@ -440,31 +500,65 @@
         const summarizeBtn = document.getElementById('summarizeBtn');
         if (summarizeBtn) {
           summarizeBtn.addEventListener('click', async () => {
-            if (!lastResult) return;
-            const map = loadNameMap();
-            try {
-              const res2 = await fetch('/api/summarize', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  text: lastResult?.text || '',
-                  words: lastResult?.words || [],
-                  language_code: lastResult?.language_code,
-                  speaker_names: map,
-                }),
-              });
-              if (res2.ok) {
-                const j2 = await res2.json();
-                if (j2?.summary_text) {
-                  renderSummaryMarkdownInto(summaryEl, j2.summary_text);
-                  return;
-                }
-              }
-              summaryEl.innerHTML = buildSummary(lastResult, map);
-            } catch (_) {
-              summaryEl.innerHTML = buildSummary(lastResult, map);
-            }
+            await summarizeWithCalendarContext();
           });
+        }
+      }
+
+      // Reusable summarization with calendar context
+      async function summarizeWithCalendarContext() {
+        if (!lastResult) return;
+        const map = loadNameMap();
+        let calendar_context = '';
+        try {
+          const selectedId = (document.getElementById('msEvents') || {}).value;
+          if (selectedId && window.msal && msalApp && msConfig?.enabled) {
+            const token = await ensureToken(['Calendars.Read']);
+            const res = await fetch(`https://graph.microsoft.com/v1.0/me/events/${selectedId}?$select=subject,bodyPreview,body,location,organizer,start,end`, {
+              headers: { Authorization: `Bearer ${token}` }
+            });
+            if (res.ok) {
+              const ev = await res.json();
+              const subject = ev?.subject || '';
+              const bodyPreview = ev?.bodyPreview || '';
+              const body = (ev?.body?.content || '').replace(/<[^>]+>/g, ' ').slice(0, 4000);
+              const loc = ev?.location?.displayName || '';
+              const when = `${ev?.start?.dateTime || ''} ${ev?.start?.timeZone || ''} - ${ev?.end?.dateTime || ''} ${ev?.end?.timeZone || ''}`.trim();
+              const org = ev?.organizer?.emailAddress?.name || '';
+              calendar_context = [
+                subject ? `Subject: ${subject}` : '',
+                bodyPreview ? `BodyPreview: ${bodyPreview}` : '',
+                body ? `Body: ${body}` : '',
+                loc ? `Location: ${loc}` : '',
+                when ? `Time: ${when}` : '',
+                org ? `Organizer: ${org}` : ''
+              ].filter(Boolean).join('\n');
+            }
+          }
+        } catch (_) { /* ignore */ }
+
+        try {
+          const res2 = await fetch('/api/summarize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: lastResult?.text || '',
+              words: lastResult?.words || [],
+              language_code: lastResult?.language_code,
+              speaker_names: map,
+              calendar_context,
+            }),
+          });
+          if (res2.ok) {
+            const j2 = await res2.json();
+            if (j2?.summary_text) {
+              renderSummaryMarkdownInto(summaryEl, j2.summary_text);
+              return;
+            }
+          }
+          summaryEl.innerHTML = buildSummary(lastResult, map);
+        } catch (_) {
+          summaryEl.innerHTML = buildSummary(lastResult, map);
         }
       }
 

@@ -10,6 +10,7 @@ Recent additions:
 - No prefilled speaker names between runs (each transcription starts blank)
 - Markdown-style rendering of summary headings, bullets and bold
 - Meeting times shown in your local timezone
+- Optional Notion export: save Name + AI Summary as Notion blocks to your database
 
 ### Features
 - FastAPI backend at `http://localhost:8010`
@@ -19,7 +20,10 @@ Recent additions:
   - `POST /api/transcribe` multipart upload → ElevenLabs Scribe v1
   - `POST /api/summarize` AI summary via Azure OpenAI Chat Completions
   - `GET /config/ms` MSAL config (driven by env)
+  - `GET /config/notion` Notion config (driven by env)
   - `GET /debug/key` last 6 chars of ElevenLabs key (for diagnostics)
+  - `GET /debug/notion` lengths + suffixes of Notion creds (non-sensitive)
+  - `POST /api/notion/export` create a Notion page under your database
 
 ## Prerequisites
 - macOS/Linux/Windows
@@ -57,6 +61,10 @@ AZURE_OPENAI_DEPLOYMENT=YOUR_DEPLOYMENT_NAME
 MS_CLIENT_ID=YOUR_APP_CLIENT_ID
 MS_TENANT_ID=common
 MS_REDIRECT_URI=http://localhost:8010/
+
+# Notion (optional)
+NOTION_API_KEY=YOUR_NOTION_INTEGRATION_SECRET
+NOTION_DATABASE_ID=YOUR_DATABASE_ID  # dashed or undashed; we normalize automatically
 ```
 Notes:
 - Do not commit `.env` to git; `.gitignore` excludes it.
@@ -74,6 +82,7 @@ Open `http://localhost:8010/` in your browser.
 2) Enter speaker names under Speakers → click Apply names
 3) Click Summarize to generate an AI summary that uses those speaker names
 4) Optional: Microsoft 365 → Load my meetings → pick an event → Save notes to event
+5) Optional: Notion → set a Title → Export to Notion
 
 ## ElevenLabs Speech-to-Text
 - Uses the official Python SDK and `model_id="scribe_v1"`
@@ -95,6 +104,7 @@ If you see 401 with `missing_permissions: speech_to_text`, ensure your ElevenLab
 - The server reads `text`, `words`, `language_code`, and optional speaker name map and returns `summary_text`
 - The prompt enforces the detected transcript language (e.g., Norwegian if `nor`) and structured headings
 - Token limit is set to `max_tokens: 1000` by default (see `main.py`)
+ - For long transcripts we split into chunks (map-reduce) and synthesize a final summary
 
 Example test:
 ```bash
@@ -128,6 +138,37 @@ Notes:
 - The UI uses `calendarView` in a window (-1 day, +30 days)
 - Times are rendered in your local timezone
 
+## Notion (Optional)
+
+### Setup
+- Create a Notion internal integration and copy the secret (`NOTION_API_KEY`).
+- Share your target database with the integration (Notion: open DB → Share → Invite the integration → Can edit).
+- Copy the database ID from the URL (32 hex chars). Dashes or no dashes are both accepted by this app.
+
+Add to `.env` and restart:
+```bash
+NOTION_API_KEY=ntn_...
+NOTION_DATABASE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # or dashed UUID form
+```
+
+Diagnostics:
+```bash
+curl -s http://localhost:8010/config/notion
+curl -s http://localhost:8010/debug/notion
+```
+
+### What gets written
+- A new page is created in your database with:
+  - Name (Title) = the Title you set in the UI (defaults to “Audio Summary”)
+  - Content blocks:
+    - Heading: “AI Summary”
+    - Paragraph: the summary text
+    - Optional: “Transcript” code block (HTML) when available
+
+Notes:
+- We avoid strict property coupling (no need to add a `Summary` property in the DB).
+- Database ID is normalized to dashed UUID automatically.
+
 ## Troubleshooting
 
 ### Transcribe returns 401 missing_permissions
@@ -149,6 +190,10 @@ Notes:
 
 ### Summary ignores edited speaker names
 - After transcription, enter names under Speakers → click Apply names → click Summarize to re-run the LLM with your current names.
+
+### Notion panel shows “Notion is not configured”
+- Ensure `.env` has `NOTION_API_KEY` and `NOTION_DATABASE_ID`, share the database with the integration, restart the server, hard refresh.
+- Use `/debug/notion` to verify lengths/suffixes are visible to the server.
 
 ## Project structure
 ```
